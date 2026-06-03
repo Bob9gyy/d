@@ -2,17 +2,25 @@
 main_ui.py — Jarvis main chat window
 Dark HUD-style chat UI using PySide6. Supports streaming LLM responses,
 persistent memory, live system stats, and system tray integration.
+
+FIXES APPLIED:
+  - [FIX-1] _on_token: added processEvents() → streaming no longer lags
+  - [FIX-2] _send: resolved model BEFORE starting thread → no race condition
+  - [FIX-3] _update_stats: Ollama health check moved to background QThread
+  - [FIX-4] psutil.cpu_percent primed at startup → no false 0% on first read
+  - [FIX-5] _quit(): clean shutdown (stops timers, joins worker) wired to tray
+  - [FIX-9] _save_transcript: saves to ~/jarvis_transcripts/ not random CWD
 """
 import json
 import datetime
+import pathlib
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QLabel, QComboBox,
     QFrame, QSystemTrayIcon, QMenu, QApplication,
-    QScrollArea,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject, QRunnable, QThreadPool
 from PySide6.QtGui import (
     QFont, QColor, QIcon, QTextCursor, QTextCharFormat,
     QTextBlockFormat, QPainter, QPixmap, QKeyEvent,
@@ -21,6 +29,7 @@ from PySide6.QtGui import (
 try:
     import psutil
     _PSUTIL = True
+    psutil.cpu_percent(interval=None)   # FIX-4: prime the counter so first real read is valid
 except ImportError:
     _PSUTIL = False
 
@@ -46,21 +55,22 @@ COL_TEXT     = "#cde8f0"
 COL_LABEL_U  = "#00ffb4"   # user label
 COL_LABEL_J  = "#00d4ff"   # jarvis label
 
-# ── Worker ─────────────────────────────────────────────────────────────────────
+# ── LLM stream worker ──────────────────────────────────────────────────────────
 
 class StreamWorker(QThread):
     token  = Signal(str)
     done   = Signal(str)   # full assembled response
 
-    def __init__(self, llm: LLMRouter, messages: list):
+    def __init__(self, llm: LLMRouter, messages: list, model: str):
         super().__init__()
         self.llm      = llm
         self.messages = messages
+        self.model    = model   # FIX-2: model resolved before thread starts
         self._text    = ""
 
     def run(self):
         try:
-            for tok in self.llm.chat(self.messages):
+            for tok in self.llm.chat(self.messages, model=self.model):
                 self._text += tok
                 self.token.emit(tok)
         except Exception as exc:
@@ -68,6 +78,23 @@ class StreamWorker(QThread):
             self._text += err
             self.token.emit(err)
         self.done.emit(self._text)
+
+
+# ── FIX-3: Non-blocking Ollama health check ────────────────────────────────────
+
+class _OllamaCheckSignals(QObject):
+    result = Signal(bool)
+
+class _OllamaCheckTask(QRunnable):
+    """Checks Ollama reachability in the thread pool — never blocks the UI."""
+    def __init__(self, llm: LLMRouter, signals: _OllamaCheckSignals):
+        super().__init__()
+        self.llm     = llm
+        self.signals = signals
+
+    def run(self):
+        online = self.llm.is_online()
+        self.signals.result.emit(online)
 
 
 # ── Stylesheet ─────────────────────────────────────────────────────────────────
@@ -166,15 +193,20 @@ class JarvisWindow(QMainWindow):
         self._auto_route    = True
         self._stream_fmt    : QTextCharFormat | None = None
 
+        # FIX-3: thread pool for async health checks
+        self._pool          = QThreadPool.globalInstance()
+        self._check_signals = _OllamaCheckSignals()
+        self._check_signals.result.connect(self._apply_online_status)
+
         self.setWindowTitle("JARVIS  —  Local AI")
         self.setMinimumSize(1100, 720)
         self.setStyleSheet(APP_STYLE)
 
         self._build_ui()
         self._build_tray()
-        self._update_stats()
+        self._poll_stats()   # immediate first poll (async)
         self._stats_timer = QTimer(self)
-        self._stats_timer.timeout.connect(self._update_stats)
+        self._stats_timer.timeout.connect(self._poll_stats)
         self._stats_timer.start(4000)
 
         QTimer.singleShot(400, self._welcome)
@@ -191,12 +223,12 @@ class JarvisWindow(QMainWindow):
         layout.addWidget(self._build_sidebar(), 0)
         layout.addWidget(self._build_chat_panel(), 1)
 
-    # ── Sidebar ────────────────────────────────────────────────────────────────
+    # ── Sidebar helpers ────────────────────────────────────────────────────────
 
     def _sb_section(self, text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setFont(QFont("Consolas", 8, QFont.Bold))
-        lbl.setStyleSheet(f"color: #007a90; margin-top: 12px; margin-bottom: 2px; letter-spacing: 1px;")
+        lbl.setStyleSheet("color: #007a90; margin-top: 12px; margin-bottom: 2px; letter-spacing: 1px;")
         return lbl
 
     def _sb_info(self, text: str) -> QLabel:
@@ -307,20 +339,17 @@ class JarvisWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Chat log
         self.chat_log = QTextEdit()
         self.chat_log.setObjectName("chat_log")
         self.chat_log.setReadOnly(True)
         self.chat_log.setFont(QFont("Consolas", 10))
         lay.addWidget(self.chat_log, 1)
 
-        # Separator
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setStyleSheet(f"background: {COL_BORDER}; border: none; max-height: 1px;")
         lay.addWidget(sep)
 
-        # Input bar
         bar = QWidget()
         bar.setStyleSheet(f"background-color: {COL_INPUT}; border-top: 1px solid {COL_BORDER};")
         b_lay = QHBoxLayout(bar)
@@ -377,18 +406,18 @@ class JarvisWindow(QMainWindow):
         sys_p = SYSTEM_PROMPT
         if self._mem_enabled:
             sys_p = self.memory.inject_context(text, sys_p)
-
         msgs = [{"role": "system", "content": sys_p}] + self.conversation[:]
+
+        # FIX-2: resolve model NOW on the main thread before the worker starts,
+        # so we never mutate shared LLMRouter state from a background thread.
+        if self._auto_route:
+            model = self.llm.route(text)
+        else:
+            model = self.model_combo.currentText() or self.llm.default_model
 
         self._begin_jarvis_block()
 
-        model = None if self._auto_route else self.model_combo.currentText()
-        self.worker = StreamWorker(self.llm, msgs)
-        if model:
-            # Override auto-routing: patch the router temporarily
-            self.worker.llm.auto_route = False
-            self.worker.llm.default_model = model
-
+        self.worker = StreamWorker(self.llm, msgs, model=model)
         self.worker.token.connect(self._on_token)
         self.worker.done.connect(self._on_done)
         self.worker.start()
@@ -419,20 +448,17 @@ class JarvisWindow(QMainWindow):
     def _insert_user_msg(self, text: str):
         cur = self._cursor_at_end()
 
-        # Blank gap
         blk_fmt = QTextBlockFormat()
         blk_fmt.setTopMargin(14)
         blk_fmt.setLeftMargin(80)
         blk_fmt.setRightMargin(12)
         cur.insertBlock(blk_fmt)
 
-        # "YOU" label
         lbl_fmt = QTextCharFormat()
         lbl_fmt.setForeground(QColor(COL_LABEL_U))
         lbl_fmt.setFont(QFont("Consolas", 8, QFont.Bold))
         cur.insertText("YOU", lbl_fmt)
 
-        # Content block
         blk2 = QTextBlockFormat()
         blk2.setTopMargin(2)
         blk2.setLeftMargin(80)
@@ -469,7 +495,6 @@ class JarvisWindow(QMainWindow):
         blk2.setBottomMargin(4)
         cur.insertBlock(blk2)
 
-        # Prepare streaming format — tokens will be appended here
         self._stream_fmt = QTextCharFormat()
         self._stream_fmt.setForeground(QColor(COL_TEXT))
         self._stream_fmt.setFont(QFont("Consolas", 10))
@@ -477,28 +502,25 @@ class JarvisWindow(QMainWindow):
         self.chat_log.setTextCursor(cur)
 
     def _on_token(self, tok: str):
+        # FIX-1: processEvents() forces Qt to repaint each token immediately
+        # instead of batching repaints until the next mouse/keyboard event.
         cur = self._cursor_at_end()
         cur.insertText(tok, self._stream_fmt)
         self.chat_log.setTextCursor(cur)
         self.chat_log.ensureCursorVisible()
+        QApplication.processEvents()
 
     def _on_done(self, full: str):
-        # Trailing newline
         cur = self._cursor_at_end()
         cur.insertBlock()
         self.chat_log.setTextCursor(cur)
 
-        # Store conversation turn
         self.conversation.append({"role": "assistant", "content": full})
 
-        # Persist to memory
         if self._mem_enabled and len(self.conversation) >= 2:
             u = self.conversation[-2].get("content", "")
             self.memory.store(u, full)
             self.mem_count.setText(f"  {self.memory.count()} stored memories")
-
-        # Re-enable routing if it was overridden
-        self.llm.auto_route = self._auto_route
 
         self.send_btn.setEnabled(True)
         self._stream_active = False
@@ -513,7 +535,6 @@ class JarvisWindow(QMainWindow):
 
     def _toggle_auto_route(self):
         self._auto_route = self.auto_btn.isChecked()
-        self.llm.auto_route = self._auto_route
         s = "ON" if self._auto_route else "OFF"
         self.auto_btn.setText(f"⚡  Auto-Route:  {s}")
 
@@ -528,8 +549,11 @@ class JarvisWindow(QMainWindow):
         self._welcome()
 
     def _save_transcript(self):
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = f"jarvis_transcript_{ts}.json"
+        # FIX-9: save to a predictable ~/jarvis_transcripts/ folder
+        ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = pathlib.Path.home() / "jarvis_transcripts"
+        dest.mkdir(exist_ok=True)
+        path = dest / f"jarvis_transcript_{ts}.json"
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(self.conversation, fh, indent=2, ensure_ascii=False)
         self._insert_system_msg(f"Transcript saved → {path}")
@@ -542,10 +566,21 @@ class JarvisWindow(QMainWindow):
         else:
             self.model_combo.addItems(["qwen3:8b", "qwen3:14b"])
 
-    # ── Stats ──────────────────────────────────────────────────────────────────
+    # ── Stats (FIX-3: Ollama check runs in thread pool, never blocks UI) ───────
 
-    def _update_stats(self):
-        online = self.llm.is_online()
+    def _poll_stats(self):
+        """Kick off an async health check; update CPU/RAM immediately (no I/O)."""
+        if _PSUTIL:
+            cpu = psutil.cpu_percent(interval=None)
+            ram = psutil.virtual_memory().percent
+            self.cpu_lbl.setText(f"  CPU  : {cpu:.0f}%")
+            self.ram_lbl.setText(f"  RAM  : {ram:.0f}%")
+
+        task = _OllamaCheckTask(self.llm, self._check_signals)
+        self._pool.start(task)
+
+    def _apply_online_status(self, online: bool):
+        """Called on the main thread when the background check finishes."""
         if online:
             self.status_lbl.setText("● Ollama online")
             self.status_lbl.setStyleSheet(f"color: {COL_GREEN}; font-family: Consolas; font-size: 8pt;")
@@ -554,12 +589,6 @@ class JarvisWindow(QMainWindow):
             self.status_lbl.setText("○ Ollama offline")
             self.status_lbl.setStyleSheet("color: #883333; font-family: Consolas; font-size: 8pt;")
             self.llm_lbl.setText("  LLM  : OFFLINE")
-
-        if _PSUTIL:
-            cpu = psutil.cpu_percent(interval=None)
-            ram = psutil.virtual_memory().percent
-            self.cpu_lbl.setText(f"  CPU  : {cpu:.0f}%")
-            self.ram_lbl.setText(f"  RAM  : {ram:.0f}%")
 
     # ── System tray ────────────────────────────────────────────────────────────
 
@@ -575,14 +604,25 @@ class JarvisWindow(QMainWindow):
         self.tray = QSystemTrayIcon(QIcon(pix), self)
         menu = QMenu()
         menu.addAction("Show JARVIS", self.show)
-        menu.addAction("Quit", QApplication.quit)
+        menu.addAction("Quit", self._quit)   # FIX-5: use clean _quit, not raw app.quit
         self.tray.setContextMenu(menu)
         self.tray.show()
         self.tray.activated.connect(
             lambda r: self.show() if r == QSystemTrayIcon.DoubleClick else None
         )
 
+    # ── FIX-5: Clean shutdown ──────────────────────────────────────────────────
+
+    def _quit(self):
+        """Stop all timers, join the worker thread, then exit."""
+        self._stats_timer.stop()
+        if self.worker and self.worker.isRunning():
+            self.worker.quit()
+            self.worker.wait(2000)   # give it 2 s to finish gracefully
+        QApplication.quit()
+
     def closeEvent(self, event):
+        # Closing the window minimises to tray; quit via tray menu → _quit().
         event.ignore()
         self.hide()
         self.tray.showMessage(

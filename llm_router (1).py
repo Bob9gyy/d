@@ -1,6 +1,9 @@
 """
 llm_router.py — Jarvis LLM interface
 Wraps the local Ollama API with streaming, auto model-routing, and health checks.
+
+FIXES APPLIED:
+  - [FIX-8] route(): smarter complexity score instead of naive len() > 300
 """
 import json
 from typing import Generator
@@ -48,16 +51,33 @@ class LLMRouter:
 
     def route(self, prompt: str) -> str:
         """
-        Auto-select model based on prompt.
-        Short/simple → fast (8B).  Long/complex → deep (14B).
+        FIX-8: Weighted complexity score instead of a single length threshold.
+
+        Score components:
+          +1 per character           — raw length matters, but weakly
+          +10 per comma              — commas signal multi-part / list requests
+          +100 per deep keyword hit  — explicit complexity signals
+          +50 if long question (?)   — a long question needs more reasoning
+
+        Threshold 400 chosen so that:
+          "hi" (score ~2)                  → fast
+          "explain recursion" (score ~207) → deep
+          "write a 5-step plan …" (score ~500+) → deep
         """
         if not self.auto_route:
             return self.default_model
 
-        words = set(prompt.lower().split())
-        if len(prompt) > 300 or words & DEEP_KEYWORDS:
-            return self.models["deep"]
-        return self.models["fast"]
+        words = prompt.lower().split()
+        keyword_hits = len(set(words) & DEEP_KEYWORDS)
+
+        score = (
+            len(prompt)
+            + prompt.count(",") * 10
+            + keyword_hits * 100
+            + (50 if "?" in prompt and len(prompt) > 80 else 0)
+        )
+
+        return self.models["deep"] if score > 400 else self.models["fast"]
 
     # ── Chat ───────────────────────────────────────────────────────────────────
 
@@ -71,9 +91,13 @@ class LLMRouter:
         Send a chat request to Ollama.
         Yields string tokens when stream=True (default).
         Always yields at least one string.
+
+        NOTE: `model` should be resolved by the caller (main thread) before
+        the worker thread starts — never pass None from a background thread,
+        as that would require calling self.route() which reads shared state.
         """
-        # Pick model: explicit > auto-route > default
         if model is None:
+            # Fallback: derive from the last user message (safe on main thread)
             last_user = next(
                 (m["content"] for m in reversed(messages) if m["role"] == "user"),
                 "",

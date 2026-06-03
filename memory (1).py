@@ -2,6 +2,10 @@
 memory.py — Jarvis persistent memory engine
 Stores conversations as embeddings in ChromaDB.
 Falls back to a no-op stub if the optional dependencies are missing.
+
+FIXES APPLIED:
+  - [FIX-6] retrieve(): filter results by cosine distance threshold (< 0.35)
+             so irrelevant memories are never injected into the system prompt.
 """
 import hashlib
 import os
@@ -15,6 +19,10 @@ try:
     _DEPS_OK = True
 except ImportError:
     _DEPS_OK = False
+
+# Cosine distance threshold for "relevant".
+# Range: 0 = identical, 2 = opposite.  < 0.35 is a solid "related" cutoff.
+_RELEVANCE_THRESHOLD = 0.35
 
 
 class MemoryEngine:
@@ -79,14 +87,35 @@ class MemoryEngine:
                       metadatas=[meta], ids=[doc_id])
 
     def retrieve(self, query: str, n_results: int = 3) -> list[str]:
-        """Return the N most semantically similar past exchanges."""
+        """
+        Return the N most semantically similar past exchanges.
+
+        FIX-6: ChromaDB always returns exactly n_results matches even when
+        none are actually related to the query.  We now request distances and
+        filter out anything above _RELEVANCE_THRESHOLD (cosine distance ≥ 0.35),
+        so the system prompt is never polluted with irrelevant old conversations.
+        """
         if not self.available or self._col.count() == 0:
             return []
 
         embedding = self._embedder.encode(query).tolist()
         n = min(n_results, self._col.count())
-        results = self._col.query(query_embeddings=[embedding], n_results=n)
-        return results["documents"][0] if results["documents"] else []
+
+        results = self._col.query(
+            query_embeddings=[embedding],
+            n_results=n,
+            include=["documents", "distances"],
+        )
+
+        docs      = results.get("documents", [[]])[0]
+        distances = results.get("distances",  [[]])[0]
+
+        # Keep only genuinely relevant results
+        relevant = [
+            doc for doc, dist in zip(docs, distances)
+            if dist < _RELEVANCE_THRESHOLD
+        ]
+        return relevant
 
     def inject_context(self, query: str, system_prompt: str) -> str:
         """
