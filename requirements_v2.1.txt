@@ -1,0 +1,39 @@
+# JARVIS v2.1 — requirements
+# Core (already in v2.0)
+psutil
+pyyaml
+
+# Multimodal: PDF
+pdfminer.six          # primary PDF text extractor
+pypdf                 # fallback PDF extractor
+
+# Multimodal: Word docs
+python-docx
+
+# Multimodal: OCR
+Pillow
+pytesseract           # also requires Tesseract binary: https://github.com/tesseract-ocr/tesseract
+
+# Multimodal: Speech-to-text
+openai-whisper        # also requires ffmpeg binary
+
+# Network/HTTP (stdlib urllib used; no extra deps required)
+# requests             # optional drop-in for http_get/http_post if you prefer
+
+# Encryption
+cryptography
+
+# File watching
+watchdog
+
+# Browser automation (optional)
+playwright            # after install: playwright install chromium
+
+# LLM providers (pick what you use)
+# openai
+# anthropic
+# ollama
+
+# Memory / vector DB (existing)
+# chromadb
+# sentence-transformers
